@@ -5,7 +5,9 @@ from typing import Optional, Literal
 import pandas as pd
 import uuid
 import os
-print("🧨 main.oy loaded")
+
+print("🧨 main.py loaded")
+
 app = FastAPI()
 
 app.add_middleware(
@@ -24,6 +26,9 @@ def health_check():
     return {"status": "FixMySheet API running"}
 
 
+# =========================
+# File reading helpers
+# =========================
 def read_table(upload: UploadFile) -> pd.DataFrame:
     """
     Read either Excel (.xlsx/.xls) or CSV.
@@ -42,6 +47,9 @@ def normalize_key(series: pd.Series) -> pd.Series:
     return series.fillna("").astype(str).str.strip()
 
 
+# =========================
+# Reconcile logic
+# =========================
 def reconcile_files(df_a: pd.DataFrame, df_b: pd.DataFrame, key: str):
     df_a[key] = normalize_key(df_a[key])
     df_b[key] = normalize_key(df_b[key])
@@ -58,70 +66,6 @@ def reconcile_files(df_a: pd.DataFrame, df_b: pd.DataFrame, key: str):
     )
 
     return matches, only_a, only_b, summary
-
-def dedupe_by_column(df: pd.DataFrame, key_column: str):
-    s = df[key_column].fillna("").astype(str).str.strip()
-
-    # Recommended behavior: blanks are NOT treated as duplicatable
-    is_blank = s.eq("")
-
-    # Mark ALL occurrences in a duplicate group as duplicate (keep=False)
-    dup_mask = s.duplicated(keep=False) & ~is_blank
-
-    out = df.copy()
-    out["DuplicateMode"] = "column"
-    out["DuplicateKey"] = s
-    out["DuplicateFlag"] = dup_mask.map(lambda x: "Duplicate" if x else "Unique")
-
-    duplicates_only = out[out["DuplicateFlag"] == "Duplicate"]
-    unique_only = out[out["DuplicateFlag"] == "Unique"]
-
-    summary = pd.DataFrame(
-        {
-            "Metric": ["Total rows", "Unique rows", "Duplicate rows", "Blank keys"],
-            "Count": [len(out), len(unique_only), len(duplicates_only), int(is_blank.sum())],
-        }
-    )
-
-    return out, duplicates_only, unique_only, summary
-
-def dedupe_by_row(df: pd.DataFrame, ignore_columns: Optional[list[str]] = None, mark_all_in_group: bool = True):
-    work = df.copy()
-
-    ignore_columns = ignore_columns or []
-    subset_cols = [c for c in work.columns if c not in ignore_columns]
-
-    if not subset_cols:
-        raise ValueError("No columns left to compare after ignoring columns.")
-
-    # Normalize strings for stable equality; normalize NaNs too
-    for c in subset_cols:
-        if work[c].dtype == "object":
-            work[c] = work[c].fillna("").astype(str).str.strip()
-        else:
-            # keep numeric as-is; just normalize NaN so equality is consistent
-            work[c] = work[c].where(work[c].notna(), None)
-
-    keep_opt = False if mark_all_in_group else "first"
-    dup_mask = work.duplicated(subset=subset_cols, keep=keep_opt)
-
-    out = df.copy()
-    out["DuplicateMode"] = "row"
-    out["DuplicateFlag"] = dup_mask.map(lambda x: "Duplicate" if x else "Unique")
-
-    duplicates_only = out[out["DuplicateFlag"] == "Duplicate"]
-    unique_only = out[out["DuplicateFlag"] == "Unique"]
-
-    summary = pd.DataFrame(
-        {
-            "Metric": ["Total rows", "Unique rows", "Duplicate rows", "Compared columns"],
-            "Count": [len(out), len(unique_only), len(duplicates_only), len(subset_cols)],
-        }
-    )
-
-    compared_cols_df = pd.DataFrame({"ComparedColumns": subset_cols})
-
-    return out, duplicates_only, unique_only, summary, compared_cols_df
 
 
 def safe_delete(path: str):
@@ -166,7 +110,6 @@ async def process_files(
         only_b.to_excel(writer, sheet_name="Only_in_File_B", index=False)
         summary.to_excel(writer, sheet_name="Summary", index=False)
 
-    # Delete after response is sent (prevents disk from filling up)
     background_tasks.add_task(safe_delete, output_path)
 
     return FileResponse(
@@ -175,18 +118,159 @@ async def process_files(
         filename="FixMySheet_Result.xlsx",
     )
 
-#=================================
+
+# =========================
+# Dedupe (Audit-friendly)
+# =========================
+KeepPolicy = Literal["mark_all", "keep_first", "keep_last"]
+DedupeMode = Literal["column", "row"]
+
+
+def _normalize_text_series(
+    s: pd.Series,
+    ignore_case: bool,
+    ignore_whitespace: bool,
+) -> pd.Series:
+    """
+    Normalize a text-like series for stable equality comparisons.
+    """
+    s = s.fillna("").astype(str)
+
+    # strip edges always
+    s = s.str.strip()
+
+    if ignore_whitespace:
+        # remove ALL whitespace (spaces, tabs, newlines)
+        s = s.str.replace(r"\s+", "", regex=True)
+
+    if ignore_case:
+        s = s.str.lower()
+
+    return s
+
+
+def _make_row_keys(
+    df: pd.DataFrame,
+    subset_cols: list[str],
+    ignore_case: bool,
+    ignore_whitespace: bool,
+) -> pd.Series:
+    """
+    Build a stable per-row comparison key from selected columns.
+    """
+    work = df[subset_cols].copy()
+
+    for c in subset_cols:
+        if work[c].dtype == "object":
+            work[c] = _normalize_text_series(work[c], ignore_case, ignore_whitespace)
+        else:
+            work[c] = work[c].where(work[c].notna(), "")
+
+        work[c] = work[c].astype(str)
+
+    delim = "\u001f"  # Unit Separator
+    return work.agg(lambda r: delim.join(r.values.tolist()), axis=1)
+
+
+def _audit_duplicate_groups(
+    *,
+    df: pd.DataFrame,
+    group_key: pd.Series,
+    display_key: Optional[pd.Series],
+    keep_policy: KeepPolicy,
+    treat_blank_as_unique: bool = True,
+) -> pd.DataFrame:
+    """
+    Compute audit-friendly duplicate annotations.
+
+    Adds:
+      - DuplicateGroupID (same for all rows in group)
+      - DuplicateCount (size of the group)
+      - DuplicateFirstSeenRow (1-based row number for first occurrence)
+      - DuplicateFlag (Unique / Kept / Duplicate)
+      - DuplicateKey (DISPLAY key - human-friendly)
+    """
+    out = df.copy()
+    out_index = out.index
+
+    # The key used for grouping (can be modified to prevent blanks grouping)
+    internal_key = group_key.fillna("").astype(str)
+
+    # The key shown to the user (never show internal blank hack strings)
+    if display_key is None:
+        display_key = group_key.fillna("").astype(str)
+    else:
+        display_key = display_key.fillna("").astype(str)
+
+    is_blank = internal_key.eq("")
+
+    # Optional: blanks should not form duplicate groups
+    if treat_blank_as_unique:
+        internal_key = internal_key.where(~is_blank, other="__BLANK__ROW__" + out_index.astype(str))
+
+    counts = internal_key.map(internal_key.value_counts())
+    in_dup_group = counts.gt(1)
+
+    # First-seen row number (1-based), per group
+    row_number = pd.Series(range(1, len(out) + 1), index=out_index)
+    first_seen = row_number.groupby(internal_key).transform("min")
+
+    # Group IDs
+    codes, _ = pd.factorize(internal_key, sort=False)
+    group_id_str = pd.Series(codes, index=out_index).map(lambda x: f"G{(x+1):06d}")
+    group_id_str = group_id_str.where(in_dup_group, other="")
+
+    # Flagging based on keep_policy
+    if keep_policy == "mark_all":
+        flag = pd.Series("Unique", index=out_index)
+        flag = flag.where(~in_dup_group, other="Duplicate")
+    elif keep_policy == "keep_first":
+        is_dup_row = internal_key.duplicated(keep="first")
+        flag = pd.Series("Unique", index=out_index)
+        flag = flag.where(~in_dup_group, other="Kept")
+        flag = flag.where(~is_dup_row, other="Duplicate")
+    elif keep_policy == "keep_last":
+        is_dup_row = internal_key.duplicated(keep="last")
+        flag = pd.Series("Unique", index=out_index)
+        flag = flag.where(~in_dup_group, other="Kept")
+        flag = flag.where(~is_dup_row, other="Duplicate")
+    else:
+        raise ValueError("keep_policy must be: mark_all | keep_first | keep_last")
+
+    # Clean display for blank keys
+    # (show blank, not internal __BLANK__ROW__)
+    display_key = display_key.where(~is_blank, other="")
+
+    out["DuplicateKey"] = display_key
+    out["DuplicateGroupID"] = group_id_str
+    out["DuplicateCount"] = counts.astype(int)
+    out["DuplicateFirstSeenRow"] = first_seen.astype(int)
+    out["DuplicateFlag"] = flag
+
+    return out
+
+
+# =========================
 # Deduplication Endpoint
-#=================================
+# =========================
 @app.post("/dedupe")
 async def dedupe(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    mode: Literal["column", "row"] = Form(...),
+    mode: DedupeMode = Form(...),
+
+    # Options
+    keep_policy: KeepPolicy = Form("mark_all"),
+    ignore_case: bool = Form(False),
+    ignore_whitespace: bool = Form(False),
+
+    # Used when mode="column"
     key_column: Optional[str] = Form(None),
-    ignore_columns: Optional[str] = Form(None),
-    mark_all_in_group: bool = Form(True),
+
+    # Used when mode="row"
+    ignore_columns: Optional[str] = Form(None),  # comma-separated list
 ):
+    # 1) Read file
     try:
         df = read_table(file)
     except Exception:
@@ -197,23 +281,38 @@ async def dedupe(
 
     df.columns = [str(c) for c in df.columns]
 
+    if keep_policy not in ("mark_all", "keep_first", "keep_last"):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "keep_policy must be: mark_all | keep_first | keep_last"},
+        )
+
+    # 2) Build group key depending on mode
     if mode == "column":
         if not key_column or not str(key_column).strip():
             return JSONResponse(status_code=400, content={"error": "key_column is required when mode='column'."})
 
         key_column = str(key_column).strip()
-
         if key_column not in df.columns:
             return JSONResponse(
                 status_code=400,
                 content={"error": f"Column '{key_column}' not found.", "columns": df.columns.tolist()},
             )
 
-        out, duplicates_only, unique_only, summary = dedupe_by_column(df, key_column)
-        compared_cols_df = pd.DataFrame({"ComparedColumns": [key_column]})
+        col_raw = df[key_column]
+        col_norm = _normalize_text_series(col_raw, ignore_case, ignore_whitespace)
+
+        out = _audit_duplicate_groups(
+            df=df,
+            group_key=col_norm,          # internal grouping uses normalized
+            display_key=col_raw,         # show original values (cleaned below for blanks)
+            keep_policy=keep_policy,
+            treat_blank_as_unique=True,
+        )
+        out.insert(0, "DuplicateMode", "column")
 
     elif mode == "row":
-        ignore_list = []
+        ignore_list: list[str] = []
         if ignore_columns and ignore_columns.strip():
             ignore_list = [c.strip() for c in ignore_columns.split(",") if c.strip()]
 
@@ -224,33 +323,30 @@ async def dedupe(
                 content={"error": f"Ignore columns not found: {bad_ignores}", "columns": df.columns.tolist()},
             )
 
-        try:
-            out, duplicates_only, unique_only, summary, compared_cols_df = dedupe_by_row(
-                df, ignore_columns=ignore_list, mark_all_in_group=mark_all_in_group
-            )
-        except ValueError as e:
-            return JSONResponse(status_code=400, content={"error": str(e)})
+        subset_cols = [c for c in df.columns if c not in ignore_list]
+        if not subset_cols:
+            return JSONResponse(status_code=400, content={"error": "No columns left to compare after ignoring columns."})
+
+        row_keys = _make_row_keys(df, subset_cols, ignore_case, ignore_whitespace)
+
+        out = _audit_duplicate_groups(
+            df=df,
+            group_key=row_keys,
+            display_key=None,  # display_key defaults to group_key for row mode
+            keep_policy=keep_policy,
+            treat_blank_as_unique=False,
+        )
+        out.insert(0, "DuplicateMode", "row")
 
     else:
         return JSONResponse(status_code=400, content={"error": "mode must be either 'column' or 'row'."})
 
+    # 3) Output workbook — ONLY All_Rows
     file_id = str(uuid.uuid4())
     output_path = os.path.join(TMP_DIR, f"dedupe_{file_id}.xlsx")
 
-    parameters = pd.DataFrame(
-        {
-            "Parameter": ["mode", "source_filename", "key_column", "ignore_columns", "mark_all_in_group"],
-            "Value": [mode, file.filename or "", key_column or "", ignore_columns or "", str(mark_all_in_group)],
-        }
-    )
-
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         out.to_excel(writer, sheet_name="All_Rows", index=False)
-        duplicates_only.to_excel(writer, sheet_name="Duplicates_Only", index=False)
-        unique_only.to_excel(writer, sheet_name="Unique_Only", index=False)
-        summary.to_excel(writer, sheet_name="Summary", index=False)
-        parameters.to_excel(writer, sheet_name="Parameters", index=False)
-        compared_cols_df.to_excel(writer, sheet_name="Compared_Columns", index=False)
 
     background_tasks.add_task(safe_delete, output_path)
 
