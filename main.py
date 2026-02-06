@@ -187,6 +187,7 @@ def _audit_duplicate_groups(
       - DuplicateGroupID (same for all rows in group)
       - DuplicateCount (size of the group)
       - DuplicateFirstSeenRow (1-based row number for first occurrence)
+      - DuplicateRankInGroup (1..N in original row order within the group)
       - DuplicateFlag (Unique / Kept / Duplicate)
       - DuplicateKey (DISPLAY key - human-friendly)
     """
@@ -214,6 +215,11 @@ def _audit_duplicate_groups(
     # First-seen row number (1-based), per group
     row_number = pd.Series(range(1, len(out) + 1), index=out_index)
     first_seen = row_number.groupby(internal_key).transform("min")
+
+    # Rank within group in original order (1..N)
+    rank_in_group = row_number.groupby(internal_key).rank(method="first").astype(int)
+    # Blank out rank for uniques
+    rank_in_group = rank_in_group.where(in_dup_group, other=pd.NA)
 
     # Group IDs
     codes, _ = pd.factorize(internal_key, sort=False)
@@ -245,6 +251,7 @@ def _audit_duplicate_groups(
     out["DuplicateGroupID"] = group_id_str
     out["DuplicateCount"] = counts.astype(int)
     out["DuplicateFirstSeenRow"] = first_seen.astype(int)
+    out["DuplicateRankInGroup"] = rank_in_group
     out["DuplicateFlag"] = flag
 
     return out
@@ -305,7 +312,7 @@ async def dedupe(
         out = _audit_duplicate_groups(
             df=df,
             group_key=col_norm,          # internal grouping uses normalized
-            display_key=col_raw,         # show original values (cleaned below for blanks)
+            display_key=col_raw,         # show original values (cleaned for blanks)
             keep_policy=keep_policy,
             treat_blank_as_unique=True,
         )
@@ -332,7 +339,7 @@ async def dedupe(
         out = _audit_duplicate_groups(
             df=df,
             group_key=row_keys,
-            display_key=None,  # display_key defaults to group_key for row mode
+            display_key=None,  # default to group_key for row mode
             keep_policy=keep_policy,
             treat_blank_as_unique=False,
         )
